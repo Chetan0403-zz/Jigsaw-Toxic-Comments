@@ -18,6 +18,7 @@ scaler = MinMaxScaler()
 from sklearn.decomposition import TruncatedSVD
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import Normalizer
+from bayes_opt import BayesianOptimization
 
 
 @contextmanager
@@ -178,9 +179,15 @@ if __name__ == '__main__':
     for keyword in ["sub", "val"]:           
         files = [filename for filename in os.listdir(path) if filename.startswith(keyword)]
         exec(keyword + "= {i:pd.read_csv(os.path.join(path,file)) for i,file in enumerate(files)}")
+           
+    # Drop 'ID' from sub frames
+    for sb in sub.values():
+        sb.drop('id', axis=1,inplace=True)
+        
             
  
     """
+    1. Logistic Regression Stacking
     Picking relevant files to stack with logistic regression without intercept
     Converting probabilities to log odds so that classifier related biases are removed
     """
@@ -192,7 +199,7 @@ if __name__ == '__main__':
         
         for num in file_nums:
             train_meta = pd.concat([train_meta, val[num]],axis=1)
-            test_meta = pd.concat([train_meta, sub[num]],axis=1)
+            test_meta = pd.concat([test_meta, sub[num]],axis=1)
         
         # Instantiate classifier
         classifier = LogisticRegression(fit_intercept = False)
@@ -250,6 +257,7 @@ if __name__ == '__main__':
 
 
     """
+    2. LightGBM stacking
     Picking relevant files to stack with Lightgbm.
     Concatenating with numerical features generated from feature engineering.
     Doing so when splitting into train and val sets
@@ -295,7 +303,6 @@ if __name__ == '__main__':
                                 #max_bin=10,
                                 n_jobs=2)
          
-
                 clf.fit(X_train_comb, y_train[:,i], 
                     eval_set=[(X_val_comb, y_val[:,i])],
                     eval_metric='auc',
@@ -323,20 +330,81 @@ if __name__ == '__main__':
         submission = pd.concat([test['id'], pd.DataFrame(submission, columns = label_cols)], axis=1)
         submission.to_csv('submission_stack_lgb.csv', index=False)   
         
-        
 
     """
-    Blending different stacks to create final submissions
+    3. Finding weights with Bayesian Optimization
+    Picking relevant files to stack with Lightgbm.
+    Concatenating with numerical features generated from feature engineering.
+    Doing so when splitting into train and val sets
+    """
+    with timer("Optimal weights with Bayesian optimization"):    
+
+        # Initialize weights dictionary with 0s        
+        weight_dict_all = {'W'+str(i):[0] for i in range(len(val))}
+                
+        for i, class_name in enumerate(label_cols):
+              
+            def opt(**kwargs): 
+                kwargs = np.array([value for key,value in kwargs.items()])
+                pred = np.zeros([train.shape[0],len(label_cols)])
+                for j in range(len(val)):                  
+                    pred[:,i] += kwargs[j]*scaler.fit_transform(val[j])[:,i]                                     
+                    auc = roc_auc_score(y[:,i], pred[:,i])                  
+                return auc
+        
+            gp_params = {"alpha": 1e-5}             
+            
+            wt = BayesianOptimization(opt,
+                           {'W'+str(i):(0,1) for i in range(len(val))}
+                          )
+            
+            wt.maximize(n_iter=10, **gp_params)        
+            weight_dict_class = wt.res['max']['max_params']
+            print("Bayes wts for class %s done. AUC is %.6f" % (class_name, wt.res['max']['max_val']))
+    
+            for key, value in weight_dict_class.items():
+                weight_dict_all[key].append(value) 
+        
+        # Calculate auc after finding all weights across all classes
+        trn_preds = np.zeros([train.shape[0],len(label_cols)])
+        pred = np.zeros([train.shape[0],len(label_cols)])
+        auc=0
+        
+        for i, class_name in enumerate(label_cols):          
+            for j in range(len(val)):                  
+                    pred[:,i] +=weight_dict_all['W'+str(j)][i+1]*scaler.fit_transform(val[j])[:,i]            
+            trn_preds[:,i] = pred[:,i]
+            auc += roc_auc_score(y[:,i], trn_preds[:,i]) / len(label_cols)
+        
+        print("AUC after full bayes opt class-wise process: %.6f" % auc)
+            
+        # apply weights on submission
+        sub_pred = np.zeros([test.shape[0], len(label_cols)])
+        pred = np.zeros([test.shape[0],len(label_cols)])
+        
+        for i, class_name in enumerate(label_cols):          
+            for j in range(len(sub)):                  
+                    pred[:,i] +=weight_dict_all['W'+str(j)][i+1]*scaler.fit_transform(sub[j])[:,i]            
+            sub_pred[:,i] = pred[:,i]
+                        
+        submission = pd.concat([test['id'], pd.DataFrame(sub_pred, columns = label_cols)], axis=1)
+        submission.to_csv('submission_stack_bayeswt.csv', index=False)   
+    
+    
+    """
+    4. Blending different stacks to create final submissions
     """            
     blend_1 = pd.read_csv("submission_stack_logreg.csv")
     blend_2 = pd.read_csv("submission_stack_lgb.csv")
+    blend_3 = pd.read_csv("submission_stack_bayeswt.csv")
     
     superblend = pd.DataFrame(np.zeros([len(blend_1),len(label_cols)]), columns = label_cols)
     
     for i in range(len(label_cols)):
         
         superblend.iloc[:,[i]] = ((blend_1.iloc[:,[i+1]] +
-                                   blend_2.iloc[:,[i+1]])/2)
+                                   blend_2.iloc[:,[i+1]] +
+                                   blend_3.iloc[:,[i+1]])/3)
             
     superblend = pd.concat([blend_1['id'], superblend], axis=1)
     superblend.to_csv("superblend.csv", index = False)
