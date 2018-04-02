@@ -185,7 +185,6 @@ if __name__ == '__main__':
         sb.drop('id', axis=1,inplace=True)
         
             
- 
     """
     1. Logistic Regression Stacking
     Picking relevant files to stack with logistic regression without intercept
@@ -408,5 +407,3 @@ if __name__ == '__main__':
             
     superblend = pd.concat([blend_1['id'], superblend], axis=1)
     superblend.to_csv("superblend.csv", index = False)
-
-              
